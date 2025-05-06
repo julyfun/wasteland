@@ -1,437 +1,347 @@
-//! A simplified implementation of the classic game "Breakout".
-//!
-//! Demonstrates Bevy's stepping capabilities if compiled with the `bevy_debug_stepping` feature.
-
 use bevy::{
-    math::bounding::{Aabb2d, BoundingCircle, BoundingVolume, IntersectsVolume},
+    color::palettes::css::{GREEN, RED},
+    core_pipeline::{Skybox, bloom::Bloom, tonemapping::Tonemapping},
+    input::mouse::MouseMotion,
+    math::vec3,
+    pbr::{FogVolume, VolumetricFog, VolumetricLight},
     prelude::*,
 };
 
-mod stepping;
+const DIRECTIONAL_LIGHT_MOVEMENT_SPEED: f32 = 0.02;
 
-// These constants are defined in `Transform` units.
-// Using the default 2D camera they correspond 1:1 with screen pixels.
-const PADDLE_SIZE: Vec2 = Vec2::new(120.0, 20.0);
-const GAP_BETWEEN_PADDLE_AND_FLOOR: f32 = 60.0;
-const PADDLE_SPEED: f32 = 500.0;
-// How close can the paddle get to the wall
-const PADDLE_PADDING: f32 = 10.0;
+/// The current settings that the user has chosen.
+#[derive(Resource)]
+struct AppSettings {
+    /// Whether volumetric spot light is on.
+    volumetric_spotlight: bool,
+    /// Whether volumetric point light is on.
+    volumetric_pointlight: bool,
+}
 
-// We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
-const BALL_STARTING_POSITION: Vec3 = Vec3::new(0.0, -50.0, 1.0);
-const BALL_DIAMETER: f32 = 30.;
-const BALL_SPEED: f32 = 400.0;
-const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            volumetric_spotlight: true,
+            volumetric_pointlight: true,
+        }
+    }
+}
 
-const WALL_THICKNESS: f32 = 10.0;
-// x coordinates
-const LEFT_WALL: f32 = -450.;
-const RIGHT_WALL: f32 = 450.;
-// y coordinates
-const BOTTOM_WALL: f32 = -300.;
-const TOP_WALL: f32 = 300.;
+#[derive(Component)]
+struct Velocity {
+    /// The velocity of the object.
+    velocity: Vec3,
+}
 
-const BRICK_SIZE: Vec2 = Vec2::new(100., 30.);
-// These values are exact
-const GAP_BETWEEN_PADDLE_AND_BRICKS: f32 = 270.0;
-const GAP_BETWEEN_BRICKS: f32 = 5.0;
-// These values are lower bounds, as the number of bricks is computed
-const GAP_BETWEEN_BRICKS_AND_CEILING: f32 = 20.0;
-const GAP_BETWEEN_BRICKS_AND_SIDES: f32 = 20.0;
+impl Default for Velocity {
+    fn default() -> Self {
+        Self {
+            velocity: Vec3::ZERO,
+        }
+    }
+}
 
-const SCOREBOARD_FONT_SIZE: f32 = 33.0;
-const SCOREBOARD_TEXT_PADDING: Val = Val::Px(5.0);
-
-const BACKGROUND_COLOR: Color = Color::srgb(0.9, 0.9, 0.9);
-const PADDLE_COLOR: Color = Color::srgb(0.3, 0.3, 0.7);
-const BALL_COLOR: Color = Color::srgb(1.0, 0.5, 0.5);
-const BRICK_COLOR: Color = Color::srgb(0.5, 0.5, 1.0);
-const WALL_COLOR: Color = Color::srgb(0.8, 0.8, 0.8);
-const TEXT_COLOR: Color = Color::srgb(0.5, 0.5, 1.0);
-const SCORE_COLOR: Color = Color::srgb(1.0, 0.5, 0.5);
+// Define a struct to store parameters for the point light's movement.
+#[derive(Component)]
+struct MoveBackAndForthHorizontally {
+    min_x: f32,
+    max_x: f32,
+    speed: f32,
+}
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .add_plugins(
-            stepping::SteppingPlugin::default()
-                .add_schedule(Update)
-                .add_schedule(FixedUpdate)
-                .at(Val::Percent(35.0), Val::Percent(50.0)),
-        )
-        .insert_resource(Score(0))
-        .insert_resource(ClearColor(BACKGROUND_COLOR))
-        .add_event::<CollisionEvent>()
+        .insert_resource(ClearColor(Color::Srgba(Srgba {
+            red: 0.02,
+            green: 0.02,
+            blue: 0.02,
+            alpha: 1.0,
+        })))
+        .insert_resource(AmbientLight::NONE)
+        .init_resource::<AppSettings>()
         .add_systems(Startup, setup)
-        // Add our gameplay simulation systems to the fixed timestep schedule
-        // which runs at 64 Hz by default
-        .add_systems(
-            FixedUpdate,
-            (
-                apply_velocity,
-                move_paddle,
-                check_for_collisions,
-                play_collision_sound,
-            )
-                // `chain`ing systems together runs them in order
-                .chain(),
-        )
-        .add_systems(Update, update_scoreboard)
+        .add_systems(Update, tweak_scene)
+        .add_systems(Update, (move_directional_light, move_point_light))
+        .add_systems(Update, move_camera)
+        .add_systems(Update, gravity_simulation)
+        .add_systems(Update, adjust_app_settings)
         .run();
 }
 
-#[derive(Component)]
-struct Paddle;
+/// Initializes the scene.
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: Res<AppSettings>) {
+    // Spawn the glTF scene.
+    commands.spawn(SceneRoot(asset_server.load(
+        GltfAssetLabel::Scene(0).from_asset("models/VolumetricFogExample/VolumetricFogExample.glb"),
+    )));
 
-#[derive(Component)]
-struct Ball;
-
-#[derive(Component, Deref, DerefMut)]
-struct Velocity(Vec2);
-
-#[derive(Event, Default)]
-struct CollisionEvent;
-
-#[derive(Component)]
-struct Brick;
-
-#[derive(Resource, Deref)]
-struct CollisionSound(Handle<AudioSource>);
-
-// Default must be implemented to define this as a required component for the Wall component below
-#[derive(Component, Default)]
-struct Collider;
-
-// This is a collection of the components that define a "Wall" in our game
-#[derive(Component)]
-#[require(Sprite, Transform, Collider)]
-struct Wall;
-
-/// Which side of the arena is this wall located on?
-enum WallLocation {
-    Left,
-    Right,
-    Bottom,
-    Top,
-}
-
-impl WallLocation {
-    /// Location of the *center* of the wall, used in `transform.translation()`
-    fn position(&self) -> Vec2 {
-        match self {
-            WallLocation::Left => Vec2::new(LEFT_WALL, 0.),
-            WallLocation::Right => Vec2::new(RIGHT_WALL, 0.),
-            WallLocation::Bottom => Vec2::new(0., BOTTOM_WALL),
-            WallLocation::Top => Vec2::new(0., TOP_WALL),
-        }
-    }
-
-    /// (x, y) dimensions of the wall, used in `transform.scale()`
-    fn size(&self) -> Vec2 {
-        let arena_height = TOP_WALL - BOTTOM_WALL;
-        let arena_width = RIGHT_WALL - LEFT_WALL;
-        // Make sure we haven't messed up our constants
-        assert!(arena_height > 0.0);
-        assert!(arena_width > 0.0);
-
-        match self {
-            WallLocation::Left | WallLocation::Right => {
-                Vec2::new(WALL_THICKNESS, arena_height + WALL_THICKNESS)
-            }
-            WallLocation::Bottom | WallLocation::Top => {
-                Vec2::new(arena_width + WALL_THICKNESS, WALL_THICKNESS)
-            }
-        }
-    }
-}
-
-impl Wall {
-    // This "builder method" allows us to reuse logic across our wall entities,
-    // making our code easier to read and less prone to bugs when we change the logic
-    // Notice the use of Sprite and Transform alongside Wall, overwriting the default values defined for the required components
-    fn new(location: WallLocation) -> (Wall, Sprite, Transform) {
-        (
-            Wall,
-            Sprite::from_color(WALL_COLOR, Vec2::ONE),
-            Transform {
-                // We need to convert our Vec2 into a Vec3, by giving it a z-coordinate
-                // This is used to determine the order of our sprites
-                translation: location.position().extend(0.0),
-                // The z-scale of 2D objects must always be 1.0,
-                // or their ordering will be affected in surprising ways.
-                // See https://github.com/bevyengine/bevy/issues/4149
-                scale: location.size().extend(1.0),
+    // Spawn the camera.
+    commands
+        .spawn((
+            Camera3d::default(),
+            Camera {
+                hdr: true,
                 ..default()
             },
-        )
-    }
-}
+            Transform::from_xyz(-1.7, 1.5, 4.5).looking_at(vec3(-1.5, 1.7, 3.5), Vec3::Y),
+            Velocity::default(),
+            Tonemapping::TonyMcMapface,
+            Bloom::default(),
+        ))
+        .insert(Skybox {
+            image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
+            brightness: 1000.0,
+            ..default()
+        })
+        .insert(VolumetricFog {
+            // This value is explicitly set to 0 since we have no environment map light
+            ambient_intensity: 0.0,
+            ..default()
+        });
 
-// This resource tracks the game's score
-#[derive(Resource, Deref, DerefMut)]
-struct Score(usize);
-
-#[derive(Component)]
-struct ScoreboardUi;
-
-// Add the game's entities to our world
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    asset_server: Res<AssetServer>,
-) {
-    // Camera
-    commands.spawn(Camera2d);
-
-    // Sound
-    let ball_collision_sound = asset_server.load("sounds/breakout_collision.ogg");
-    commands.insert_resource(CollisionSound(ball_collision_sound));
-
-    // Paddle
-    let paddle_y = BOTTOM_WALL + GAP_BETWEEN_PADDLE_AND_FLOOR;
-
+    // Add the point light
     commands.spawn((
-        Sprite::from_color(PADDLE_COLOR, Vec2::ONE),
-        Transform {
-            translation: Vec3::new(0.0, paddle_y, 0.0),
-            scale: PADDLE_SIZE.extend(1.0),
+        Transform::from_xyz(-0.4, 1.9, 1.0),
+        PointLight {
+            shadows_enabled: true,
+            range: 150.0,
+            color: GREEN.into(),
+            intensity: 1000.0,
             ..default()
         },
-        Paddle,
-        Collider,
+        VolumetricLight,
+        MoveBackAndForthHorizontally {
+            min_x: -1.93,
+            max_x: -0.4,
+            speed: -0.8,
+        },
     ));
 
-    // Ball
+    // Add the spot light
     commands.spawn((
-        Mesh2d(meshes.add(Circle::default())),
-        MeshMaterial2d(materials.add(BALL_COLOR)),
-        Transform::from_translation(BALL_STARTING_POSITION)
-            .with_scale(Vec2::splat(BALL_DIAMETER).extend(1.)),
-        Ball,
-        Velocity(INITIAL_BALL_DIRECTION.normalize() * BALL_SPEED),
-    ));
-
-    // Scoreboard
-    commands.spawn((
-        Text::new("Score: "),
-        TextFont {
-            font_size: SCOREBOARD_FONT_SIZE,
+        Transform::from_xyz(-1.8, 3.9, -2.7).looking_at(Vec3::ZERO, Vec3::Y),
+        SpotLight {
+            intensity: 2000.0, // lumens
+            color: Color::WHITE,
+            shadows_enabled: true,
+            inner_angle: 0.76,
+            outer_angle: 0.94,
             ..default()
         },
-        TextColor(TEXT_COLOR),
-        ScoreboardUi,
+        VolumetricLight,
+    ));
+
+    // Add the fog volume.
+    commands.spawn((
+        FogVolume::default(),
+        Transform::from_scale(Vec3::splat(35.0)),
+    ));
+
+    // Add the help text.
+    commands.spawn((
+        create_text(&app_settings),
         Node {
             position_type: PositionType::Absolute,
-            top: SCOREBOARD_TEXT_PADDING,
-            left: SCOREBOARD_TEXT_PADDING,
+            top: Val::Percent(12.0),
+            left: Val::Px(12.0),
             ..default()
         },
-        children![(
-            TextSpan::default(),
-            TextFont {
-                font_size: SCOREBOARD_FONT_SIZE,
-                ..default()
-            },
-            TextColor(SCORE_COLOR),
-        )],
     ));
+}
 
-    // Walls
-    commands.spawn(Wall::new(WallLocation::Left));
-    commands.spawn(Wall::new(WallLocation::Right));
-    commands.spawn(Wall::new(WallLocation::Bottom));
-    commands.spawn(Wall::new(WallLocation::Top));
-
-    // Bricks
-    let total_width_of_bricks = (RIGHT_WALL - LEFT_WALL) - 2. * GAP_BETWEEN_BRICKS_AND_SIDES;
-    let bottom_edge_of_bricks = paddle_y + GAP_BETWEEN_PADDLE_AND_BRICKS;
-    let total_height_of_bricks = TOP_WALL - bottom_edge_of_bricks - GAP_BETWEEN_BRICKS_AND_CEILING;
-
-    assert!(total_width_of_bricks > 0.0);
-    assert!(total_height_of_bricks > 0.0);
-
-    // Given the space available, compute how many rows and columns of bricks we can fit
-    let n_columns = (total_width_of_bricks / (BRICK_SIZE.x + GAP_BETWEEN_BRICKS)).floor() as usize;
-    let n_rows = (total_height_of_bricks / (BRICK_SIZE.y + GAP_BETWEEN_BRICKS)).floor() as usize;
-    let n_vertical_gaps = n_columns - 1;
-
-    // Because we need to round the number of columns,
-    // the space on the top and sides of the bricks only captures a lower bound, not an exact value
-    let center_of_bricks = (LEFT_WALL + RIGHT_WALL) / 2.0;
-    let left_edge_of_bricks = center_of_bricks
-        // Space taken up by the bricks
-        - (n_columns as f32 / 2.0 * BRICK_SIZE.x)
-        // Space taken up by the gaps
-        - n_vertical_gaps as f32 / 2.0 * GAP_BETWEEN_BRICKS;
-
-    // In Bevy, the `translation` of an entity describes the center point,
-    // not its bottom-left corner
-    let offset_x = left_edge_of_bricks + BRICK_SIZE.x / 2.;
-    let offset_y = bottom_edge_of_bricks + BRICK_SIZE.y / 2.;
-
-    for row in 0..n_rows {
-        for column in 0..n_columns {
-            let brick_position = Vec2::new(
-                offset_x + column as f32 * (BRICK_SIZE.x + GAP_BETWEEN_BRICKS),
-                offset_y + row as f32 * (BRICK_SIZE.y + GAP_BETWEEN_BRICKS),
-            );
-
-            // brick
-            commands.spawn((
-                Sprite {
-                    color: BRICK_COLOR,
-                    ..default()
-                },
-                Transform {
-                    translation: brick_position.extend(0.0),
-                    scale: Vec3::new(BRICK_SIZE.x, BRICK_SIZE.y, 1.0),
-                    ..default()
-                },
-                Brick,
-                Collider,
-            ));
+fn create_text(app_settings: &AppSettings) -> Text {
+    format!(
+        "{}\n{}\n{}",
+        "Press WASD or the arrow keys to change the direction of the directional light",
+        if app_settings.volumetric_pointlight {
+            "Press P to turn volumetric point light off"
+        } else {
+            "Press P to turn volumetric point light on"
+        },
+        if app_settings.volumetric_spotlight {
+            "Press L to turn volumetric spot light off"
+        } else {
+            "Press L to turn volumetric spot light on"
         }
+    )
+    .into()
+}
+
+/// A system that makes directional lights in the glTF scene into volumetric
+/// lights with shadows.
+fn tweak_scene(
+    mut commands: Commands,
+    mut lights: Query<(Entity, &mut DirectionalLight), Changed<DirectionalLight>>,
+) {
+    for (light, mut directional_light) in lights.iter_mut() {
+        // Shadows are needed for volumetric lights to work.
+        directional_light.shadows_enabled = true;
+        commands.entity(light).insert(VolumetricLight);
     }
 }
 
-fn move_paddle(
+/// Processes user requests to move the directional light.
+fn move_directional_light(
+    input: Res<ButtonInput<KeyCode>>,
+    mut directional_lights: Query<&mut Transform, With<DirectionalLight>>,
+) {
+    let mut delta_theta = Vec2::ZERO;
+    if input.pressed(KeyCode::ArrowUp) {
+        delta_theta.y += DIRECTIONAL_LIGHT_MOVEMENT_SPEED;
+    }
+    if input.pressed(KeyCode::ArrowDown) {
+        delta_theta.y -= DIRECTIONAL_LIGHT_MOVEMENT_SPEED;
+    }
+    if input.pressed(KeyCode::ArrowLeft) {
+        delta_theta.x += DIRECTIONAL_LIGHT_MOVEMENT_SPEED;
+    }
+    if input.pressed(KeyCode::ArrowRight) {
+        delta_theta.x -= DIRECTIONAL_LIGHT_MOVEMENT_SPEED;
+    }
+
+    if delta_theta == Vec2::ZERO {
+        return;
+    }
+
+    let delta_quat = Quat::from_euler(EulerRot::XZY, delta_theta.y, 0.0, delta_theta.x);
+    for mut transform in directional_lights.iter_mut() {
+        transform.rotate(delta_quat);
+    }
+}
+
+// move camera by WASD keys or mouses
+fn move_camera(
+    mut camera: Query<(&mut Transform, &mut Velocity), With<Camera3d>>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut paddle_transform: Single<&mut Transform, With<Paddle>>,
+    mut evr_motion: EventReader<MouseMotion>,
+) {
+    for (mut transform, mut vel) in camera.iter_mut() {
+        let mut translation = Vec3::ZERO;
+        let right = transform.local_x();
+        let back = transform.local_z();
+        if keyboard_input.pressed(KeyCode::KeyW) {
+            translation -= back * 0.1;
+        }
+        if keyboard_input.pressed(KeyCode::KeyS) {
+            translation += back * 0.1;
+        }
+        if keyboard_input.pressed(KeyCode::KeyA) {
+            translation -= right * 0.1;
+        }
+        if keyboard_input.pressed(KeyCode::KeyD) {
+            translation += right * 0.1;
+        }
+        if keyboard_input.just_pressed(KeyCode::Space) {
+            vel.velocity.y += 7.5;
+        }
+
+        transform.translation += translation;
+        for ev in evr_motion.read() {
+            // transform.rotate(Quat::from_euler(
+            //     EulerRot::XZY,
+            //     0.0,
+            //     0.0,
+            //     -ev.delta.x * 0.01,
+            // ));
+            // delta 向右为 x+
+            // delta 向下为 y+
+            let right = transform.local_x();
+            // 绕 X 正方向为向上转
+            transform.rotate_axis(right, -ev.delta.y * 0.003);
+            let world_y = Dir3::Y; // 绕 Y 正方向为向左转
+            transform.rotate_axis(world_y, -ev.delta.x * 0.003);
+        }
+    }
+
+    // Rotate the camera based on mouse motion.
+}
+
+fn gravity_simulation(
+    mut cams: Query<(&mut Transform, &mut Velocity), With<Camera3d>>,
     time: Res<Time>,
 ) {
-    let mut direction = 0.0;
-
-    if keyboard_input.pressed(KeyCode::ArrowLeft) {
-        direction -= 1.0;
-    }
-
-    if keyboard_input.pressed(KeyCode::ArrowRight) {
-        direction += 1.0;
-    }
-
-    // Calculate the new horizontal paddle position based on player input
-    let new_paddle_position =
-        paddle_transform.translation.x + direction * PADDLE_SPEED * time.delta_secs();
-
-    // Update the paddle position,
-    // making sure it doesn't cause the paddle to leave the arena
-    let left_bound = LEFT_WALL + WALL_THICKNESS / 2.0 + PADDLE_SIZE.x / 2.0 + PADDLE_PADDING;
-    let right_bound = RIGHT_WALL - WALL_THICKNESS / 2.0 - PADDLE_SIZE.x / 2.0 - PADDLE_PADDING;
-
-    paddle_transform.translation.x = new_paddle_position.clamp(left_bound, right_bound);
-}
-
-fn apply_velocity(mut query: Query<(&mut Transform, &Velocity)>, time: Res<Time>) {
-    for (mut transform, velocity) in &mut query {
-        transform.translation.x += velocity.x * time.delta_secs();
-        transform.translation.y += velocity.y * time.delta_secs();
-    }
-}
-
-fn update_scoreboard(
-    score: Res<Score>,
-    score_root: Single<Entity, (With<ScoreboardUi>, With<Text>)>,
-    mut writer: TextUiWriter,
-) {
-    *writer.text(*score_root, 1) = score.to_string();
-}
-
-fn check_for_collisions(
-    mut commands: Commands,
-    mut score: ResMut<Score>,
-    ball_query: Single<(&mut Velocity, &Transform), With<Ball>>,
-    collider_query: Query<(Entity, &Transform, Option<&Brick>), With<Collider>>,
-    mut collision_events: EventWriter<CollisionEvent>,
-) {
-    let (mut ball_velocity, ball_transform) = ball_query.into_inner();
-
-    for (collider_entity, collider_transform, maybe_brick) in &collider_query {
-        let collision = ball_collision(
-            BoundingCircle::new(ball_transform.translation.truncate(), BALL_DIAMETER / 2.),
-            Aabb2d::new(
-                collider_transform.translation.truncate(),
-                collider_transform.scale.truncate() / 2.,
-            ),
-        );
-
-        if let Some(collision) = collision {
-            // Writes a collision event so that other systems can react to the collision
-            collision_events.write_default();
-
-            // Bricks should be despawned and increment the scoreboard on collision
-            if maybe_brick.is_some() {
-                commands.entity(collider_entity).despawn();
-                **score += 1;
-            }
-
-            // Reflect the ball's velocity when it collides
-            let mut reflect_x = false;
-            let mut reflect_y = false;
-
-            // Reflect only if the velocity is in the opposite direction of the collision
-            // This prevents the ball from getting stuck inside the bar
-            match collision {
-                Collision::Left => reflect_x = ball_velocity.x > 0.0,
-                Collision::Right => reflect_x = ball_velocity.x < 0.0,
-                Collision::Top => reflect_y = ball_velocity.y < 0.0,
-                Collision::Bottom => reflect_y = ball_velocity.y > 0.0,
-            }
-
-            // Reflect velocity on the x-axis if we hit something on the x-axis
-            if reflect_x {
-                ball_velocity.x = -ball_velocity.x;
-            }
-
-            // Reflect velocity on the y-axis if we hit something on the y-axis
-            if reflect_y {
-                ball_velocity.y = -ball_velocity.y;
-            }
+    for (mut cam, mut vel) in cams.iter_mut() {
+        cam.translation.y += vel.velocity.y * time.delta_secs();
+        if cam.translation.y < 1.0 {
+            cam.translation.y = 1.0;
+        }
+        if cam.translation.y > 1.0 {
+            vel.velocity += Vec3::new(0.0, -9.8, 0.0) * time.delta_secs();
         }
     }
 }
 
-fn play_collision_sound(
-    mut commands: Commands,
-    mut collision_events: EventReader<CollisionEvent>,
-    sound: Res<CollisionSound>,
+// Toggle point light movement between left and right.
+fn move_point_light(
+    timer: Res<Time>,
+    mut objects: Query<(&mut Transform, &mut MoveBackAndForthHorizontally)>,
 ) {
-    // Play a sound once per frame if a collision occurred.
-    if !collision_events.is_empty() {
-        // This prevents events staying active on the next frame.
-        collision_events.clear();
-        commands.spawn((AudioPlayer(sound.clone()), PlaybackSettings::DESPAWN));
+    for (mut transform, mut move_data) in objects.iter_mut() {
+        let mut translation = transform.translation;
+        let mut need_toggle = false;
+        translation.x += move_data.speed * timer.delta_secs();
+        if translation.x > move_data.max_x {
+            translation.x = move_data.max_x;
+            need_toggle = true;
+        } else if translation.x < move_data.min_x {
+            translation.x = move_data.min_x;
+            need_toggle = true;
+        }
+        if need_toggle {
+            move_data.speed = -move_data.speed;
+        }
+        transform.translation = translation;
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-enum Collision {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
+// Adjusts app settings per user input.
+fn adjust_app_settings(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut app_settings: ResMut<AppSettings>,
+    mut point_lights: Query<Entity, With<PointLight>>,
+    mut spot_lights: Query<Entity, With<SpotLight>>,
+    mut text: Query<&mut Text>,
+) {
+    // If there are no changes, we're going to bail for efficiency. Record that
+    // here.
+    let mut any_changes = false;
 
-// Returns `Some` if `ball` collides with `bounding_box`.
-// The returned `Collision` is the side of `bounding_box` that `ball` hit.
-fn ball_collision(ball: BoundingCircle, bounding_box: Aabb2d) -> Option<Collision> {
-    if !ball.intersects(&bounding_box) {
-        return None;
+    // If the user pressed P, toggle volumetric state of the point light.
+    if keyboard_input.just_pressed(KeyCode::KeyP) {
+        app_settings.volumetric_pointlight = !app_settings.volumetric_pointlight;
+        any_changes = true;
+    }
+    // If the user pressed L, toggle volumetric state of the spot light.
+    if keyboard_input.just_pressed(KeyCode::KeyL) {
+        app_settings.volumetric_spotlight = !app_settings.volumetric_spotlight;
+        any_changes = true;
     }
 
-    let closest = bounding_box.closest_point(ball.center());
-    let offset = ball.center() - closest;
-    let side = if offset.x.abs() > offset.y.abs() {
-        if offset.x < 0. {
-            Collision::Left
+    // If there were no changes, bail out.
+    if !any_changes {
+        return;
+    }
+
+    // Update volumetric settings.
+    for point_light in point_lights.iter_mut() {
+        if app_settings.volumetric_pointlight {
+            commands.entity(point_light).insert(VolumetricLight);
         } else {
-            Collision::Right
+            commands.entity(point_light).remove::<VolumetricLight>();
         }
-    } else if offset.y > 0. {
-        Collision::Top
-    } else {
-        Collision::Bottom
-    };
+    }
+    for spot_light in spot_lights.iter_mut() {
+        if app_settings.volumetric_spotlight {
+            commands.entity(spot_light).insert(VolumetricLight);
+        } else {
+            commands.entity(spot_light).remove::<VolumetricLight>();
+        }
+    }
 
-    Some(side)
+    // Update the help text.
+    for mut text in text.iter_mut() {
+        *text = create_text(&app_settings);
+    }
 }
